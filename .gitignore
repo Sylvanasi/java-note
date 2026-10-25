@@ -1,0 +1,6 @@
+# Obsidian local settings and cache
+.obsidian/
+.trash/
+
+# macOS metadata
+.DS_Store
