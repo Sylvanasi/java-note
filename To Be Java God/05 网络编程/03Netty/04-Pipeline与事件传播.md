@@ -1,29 +1,29 @@
 # 04｜Pipeline 与事件传播
 
-## 1. Pipeline、Handler、Context
+![[附件/知识总览/04-Pipeline与事件传播.svg]]
 
-- Pipeline：当前 Channel 的处理链。
-- Handler：实际处理事件的方法所在对象。
-- Context：这个 Handler 在这条 Pipeline 中的节点与操作入口。
+## 1. Pipeline、Handler 与 Context
 
-Pipeline 内部用 HandlerContext 双向链表组织 Handler。入站和出站沿不同方向查找匹配处理器，使用同一条链。
+| 对象 | 职责 |
+|---|---|
+| ChannelPipeline | 一个 Channel 的处理链，组织事件处理步骤 |
+| ChannelHandler | 实际提供事件处理方法的对象 |
+| ChannelHandlerContext | Handler 在这条 Pipeline 中的节点与操作入口 |
 
-双向结构便于从当前 Context 向前或向后传播，同时维护添加、删除等操作。并不是必须使用两条独立的单向链。
+DefaultChannelPipeline 内部以 Context 双向链表组织 Handler。入站和出站沿不同方向查找匹配的节点，使用同一条链，而不是两条互不相关的处理链。
 
-## 2. 入站与出站
+一个满足共享条件的 Handler 可以出现在不同 Pipeline 中，但每处安装都有自己的 Context。不能把 Handler 对象与某条链上的节点视为同一概念。
 
-```text
-链表顺序：HEAD → 分帧器 → 解码器 → 编码器 → 业务 Handler → TAIL
+## 2. 入站、出站与处理器方向
 
-入站：网络 → 分帧器 → 解码器 → 业务 Handler
-出站：业务 Handler 发起写出 → 编码器 → 网络
-```
+以依次添加分帧器、解码器、编码器和业务 Handler 为例，网络数据按入站方向经过分帧、解码和业务处理；编码器若只处理出站操作，会被入站消息跳过。业务发起写操作时按出站方向寻找适用的处理器，由编码器将对象转成字节，再交给传输层。
 
-传播时会跳过不处理当前方向或事件的方法。
+| 方向 | 典型事件或操作 | 默认链表查找方向 |
+|---|---|---|
+| 入站 | channelActive、channelRead、channelInactive、用户事件 | 从 HEAD 一侧向 TAIL 一侧 |
+| 出站 | write、flush、close 等 | 从 TAIL 一侧向 HEAD 一侧 |
 
-- 入站例子：连接激活、读到数据、连接失活、用户事件。
-- 出站例子：write、flush、close 等操作。
-- 一个 ChannelDuplexHandler 能同时参与两个方向。
+ChannelDuplexHandler 可以参与两个方向。方向表示事件与操作的传播，不表示服务端只能接收、客户端只能发送。
 
 ## 3. 入站如何继续传播
 
@@ -35,33 +35,29 @@ public void channelRead(ChannelHandlerContext ctx, Object msg) {
 }
 ```
 
-普通入站 Handler 如果既不传播也不输出转换结果，后续 Handler 就收不到这条消息。
+ctx.fireChannelRead 从当前 Context 后面的适用入站节点继续传播，不重新调用当前节点。普通 Handler 消费事件后不再传播，下游就不会收到这次事件；消费引用计数消息时还需遵守释放责任。
 
-在编解码器的 decode 方法中，通常把结果放入 out，由父类负责传播，不要再重复 fire 同一结果。
-
-## 4. super 与 fire
+在编解码器的 decode 方法中，通常把转换结果加入 out，由父类传播，不要再 fire 同一结果造成重复。
 
 ```java
-ctx.fireChannelActive();
+@Override
+public void channelActive(ChannelHandlerContext ctx) throws Exception {
+    super.channelActive(ctx);
+}
 ```
 
-表示从当前节点继续向后传播激活事件。适配器默认的 `super.channelActive(ctx)` 也会继续传播，所以通常二选一，不要两种都调用而造成重复传播。
+ChannelInboundHandlerAdapter 的默认 channelActive 会继续传播。因此该方法中的 super.channelActive(ctx) 与 ctx.fireChannelActive() 通常二选一。这个结论针对默认适配器实现，不代表任意父类的 super 方法都只是转发。
 
-它与过滤器链“当前节点处理后交给下一节点”的思路相似，但 Netty 还处理事件方向、执行器切换与引用计数等问题。
+## 4. 写操作起点与 Promise 透传
 
-## 5. ctx.write 与 channel.write
+| 调用 | 出站查找起点 |
+|---|---|
+| ctx.writeAndFlush(reply) | 当前 Context 的前面，不包含当前节点 |
+| ctx.channel().writeAndFlush(reply) | 从 Pipeline 尾部发起 |
 
-```java
-ctx.writeAndFlush(reply);
-ctx.channel().writeAndFlush(reply);
-```
+因此，当业务 Handler 使用自己的 ctx 写出时，需要经过的编码器应放在它前面。放在其后面的编码器可能被跳过。排列顺序必须结合调用起点分析，不能只背“出站反向”。
 
-- Context 发起写出：从当前 Context 向前寻找出站处理器。
-- Channel 发起写出：通常从 Pipeline 尾部发起，反向经过匹配的出站处理器。
-
-因此，编码器应位于业务 Handler 的前面，才能被该业务 Context 的写出路径经过。
-
-出站 Handler 继续传递时要保留 promise：
+在某个出站 Handler 自身的 write 方法中，继续使用 ctx.write(msg, promise) 可向前透传；改用 channel.write 可能从尾部重新经过自己，引起重复处理或递归。
 
 ```java
 @Override
@@ -72,49 +68,31 @@ public void write(ChannelHandlerContext ctx,
 }
 ```
 
-## 6. fireChannelRead 是同步还是异步
+原 Promise 将这次写操作的结果传给调用方。若自行丢弃消息，也必须按语义完成或失败该 Promise，并处理消息资源，不能让结果一直悬而未决。
 
-每次找到下一个目标 Context 后，Netty 大致做这样的判断：
+## 5. 同步调用、任务提交与返回边界
 
-```text
-当前线程能否直接执行目标 Context？
-    ├─ 能 → 直接调用目标方法
-    └─ 不能 → 向目标执行器提交任务
-```
+Netty 找到目标 Context 后，会根据目标执行器与当前线程判断：可以在当前线程执行时直接调用；需要切换执行器时提交任务。
 
-所以它不是固定的“全同步”或“全异步”。
-
-当前实验的典型链路：
-
-```text
-worker：网络日志 → 分帧 → 字节解码成对象 → 提交业务任务
-                                            ↓
-businessGroup：                         ChatHandler
-```
-
-worker 的 fireChannelRead 可以在业务任务完成前返回。业务日志和外层“传播调用返回”日志没有固定的跨线程先后顺序。
-
-## 7. 调用返回不等于全链路完成
+所以 fireChannelRead 不是固定的全同步或全异步。比如 worker 上完成分帧、解码后将业务 Handler 提交给 businessGroup，传播调用可以先返回，业务任务仍在排队或运行。跨线程日志的先后不能仅从源码行顺序推断。
 
 ```java
 try {
     ctx.fireChannelRead(msg);
     System.out.println("传播调用已返回");
 } finally {
-    // 在本 try 结束或异常退出时执行
+    // 这里只表示当前代码块退出
 }
 ```
 
-- 没有切线程的同步方法，返回前已经执行到对应返回点。
-- 已提交到其他执行器的任务，此时可能仍在排队或运行。
-- 分帧器即使同步返回，也可能保存着不完整的数据等待以后处理。
-- finally 管理当前代码块的退出，不是整个异步处理链的完成回调。
+finally 不是整个异步链的完成通知。即使没有线程切换，分帧器也可能只积累了一段数据并返回，还没有输出完整业务消息。因此“调用返回”“完整消息已产生”“业务已完成”是不同判断。
 
-## 8. 怎样理解日志的粒度
+## 6. 日志粒度与读指针
 
-分帧前的 ByteBuf 日志反映一次入站读取事件，不等于一个 TCP 报文，也不保证是一条完整业务消息。
+分帧前的 ByteBuf 日志反映交给该处理器的一次字节事件，不保证对应一个 TCP 报文或一条业务消息。
 
-一条业务消息可能对应多次原始字节日志；一次原始字节事件也可能产生多条分帧后的消息。
+- 一条业务消息可能分多次到达，形成多次字节日志。
+- 一次字节事件可能包含多条业务消息，经分帧后分别交给下游。
+- 分帧后适合观察帧边界；解码后适合观察业务字段，两者不能替代底层字节日志。
 
-读取日志时使用不移动读指针的方法，例如 ByteBufUtil.hexDump；不要为了打印而无意消耗下游需要的数据。
-
+打印字节时使用不移动 readerIndex 的方式，例如 ByteBufUtil.hexDump。不要为了打印调用 readBytes 等消费方法，导致下游读不到数据。日志本身也要避免长时间阻塞 EventLoop。

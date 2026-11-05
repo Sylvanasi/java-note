@@ -1,79 +1,87 @@
 # 01｜Netty 总览与核心组件
 
-## 1. 一句话理解
+![[附件/知识总览/01-Netty总览与核心组件.png]]
 
-Netty 是网络应用框架。在当前使用的 NIO 传输实现中，它把连接注册、事件循环、缓冲区、异步写出和处理链组织起来，让业务代码围绕事件和消息编写。
+## 1. Netty 解决什么问题
 
-Netty 也支持其他传输实现，因此不能把整个框架严格等同于 Java NIO。当前项目的 `NioEventLoopGroup`、`NioServerSocketChannel`、`NioSocketChannel` 使用 NIO。
-
-## 2. 与 BIO、NIO 的联系
+Netty 是异步、事件驱动的网络应用框架。以 NIO 传输实现为例，它把连接注册、事件循环、缓冲区、异步写出和处理链组织起来，让业务代码围绕事件与消息编写。
 
 | 模型 | 等待与处理方式 | 应用主要负责什么 |
 |---|---|---|
-| BIO | 处理线程可能阻塞在某条连接的读写上 | 连接线程、流、协议、资源关闭 |
-| 原生 NIO | 少量线程通过 Selector 等待多条连接的就绪事件 | 注册与遍历、缓冲、分帧、部分写入续写 |
-| Netty NIO 传输 | EventLoop 驱动多连接，Pipeline 组织处理过程 | 选择协议、编解码、业务与应用级资源策略 |
+| BIO | 线程可能阻塞在连接的读写操作上 | 连接线程、流、协议及资源关闭 |
+| 原生 NIO | 通过 Selector 等待多条连接的就绪事件 | 注册与遍历、缓冲、分帧、部分写入与续写 |
+| Netty NIO 传输 | EventLoop 驱动连接，Pipeline 组织处理过程 | 协议、编解码、业务及应用级资源策略 |
 
-Netty 代管了大量底层工作，但消息格式、业务确认、异常处理和连接存活规则仍要由应用定义。
+**Netty 不等同于 Java NIO。** `NioEventLoopGroup`、`NioServerSocketChannel` 和 `NioSocketChannel` 属于其 NIO 实现，框架也支持其他传输实现。
 
-## 3. 核心组件
+Netty 简化网络编程，但不会替应用定义消息格式、业务确认、异常策略及连接存活规则。
+
+## 2. 服务端处理主线
+
+### 2.1 启动与接入连接
+
+1. `ServerBootstrap` 组合线程组、Channel 类型、网络参数及处理器配置，调用 `bind()` 绑定监听地址。
+2. 监听 Channel 交给 boss 的 EventLoop 管理，负责接受连接。
+3. 接受得到的连接 Channel 注册给 worker 的某个 EventLoop，处理这条连接的 I/O。
+4. `ChannelInitializer` 为连接安装 Handler，组成它自己的 Pipeline。
+
+监听端口的 Channel 与已连接的 Channel 是不同对象。boss、worker 是职责名称，不是两种不同的 EventLoopGroup 接口类型；线程数由配置与实现决定。
+
+### 2.2 收到请求与发送回复
+
+入站数据先由分帧器识别消息边界，再由解码器转成业务对象，最后交给业务 Handler。
+
+业务生成回复后，写请求经过适用的出站 Handler，编码成网络字节，再由传输层写出。编码器本身就是一种出站 Handler，不能理解成与出站处理互不相关的另一条链。
+
+这里描述的是典型业务流程，不代表所有协议都需要独立分帧器，也不是 Pipeline 的物理排列图。入站、出站的实际传播与调用起点、Handler 类型及排列位置有关。
+
+## 3. 核心组件及原生 NIO 对照
+
+### 3.1 组件职责
 
 | 组件 | 职责 |
 |---|---|
-| Bootstrap / ServerBootstrap | 组合客户端/服务端配置并发起启动 |
-| EventLoopGroup | 管理一组事件循环 |
-| EventLoop | 处理 Channel 的 I/O 事件、普通任务、定时任务 |
-| Channel | 一条连接或监听端口的网络抽象 |
-| ChannelFuture | 表示异步 Channel 操作的状态与结果 |
-| ChannelPipeline | 按顺序组织 Handler 的处理链 |
-| ChannelHandler | 处理连接事件、数据与出站操作 |
-| ChannelHandlerContext | Handler 在当前 Pipeline 中的位置与上下文 |
-| ByteBuf | 存放和操作网络字节，支持引用计数等机制 |
+| `Bootstrap` / `ServerBootstrap` | 组合配置，分别用于客户端等场景的连接引导及服务端绑定引导 |
+| `EventLoopGroup` | 管理一组事件循环，为 Channel 分配 EventLoop |
+| `EventLoop` | 处理已注册 Channel 的 I/O 事件、普通任务与定时任务 |
+| `Channel` | 监听端口或连接等网络实体的抽象 |
+| `ChannelInitializer` | 初始化 Channel，通常用于安装处理链 |
+| `ChannelPipeline` | 按顺序组织一个 Channel 的 Handler |
+| `ChannelHandler` | 处理连接事件、消息及出站操作 |
+| `ChannelHandlerContext` | Handler 在 Pipeline 中的上下文，可访问 Channel 并传播事件或发起操作 |
+| `ByteBuf` | 存放和操作网络字节，支持引用计数等机制 |
+| `ChannelFuture` | 观察异步 Channel 操作的状态与结果 |
+| `ChannelPromise` | 在 Future 基础上允许实现方完成结果；出站透传时应继续携带原 Promise |
 
-此外，`ChannelInitializer` 用于为新建 Channel 安装处理链；`ChannelPromise` 是可由实现方完成的结果承诺，出站 Handler 透传时应继续携带它。
+**Future 是结果凭证，不是执行 I/O 的线程。** 调用返回与操作完成是两个时点，可通过监听器观察结果；在 EventLoop 中阻塞等待会影响它管理的其他连接。
 
-## 4. 原生 NIO 工作在 Netty 中的对应位置
+### 3.2 原生 NIO 的工作由谁承接
 
 | 原生 NIO 工作 | Netty 中的组织方式 |
 |---|---|
-| 打开 ServerSocketChannel、绑定端口 | ServerBootstrap + NioServerSocketChannel |
-| 监听 OP_ACCEPT 并接收连接 | boss EventLoop 处理监听 Channel |
-| 将连接注册到 Selector | Netty 将连接 Channel 注册给 worker EventLoop |
-| select、处理选中的事件、执行任务 | EventLoop 的循环 |
-| 每条连接保存自己的缓冲与状态 | Channel、Handler、附件属性等 |
-| 读取字节并拼接完整消息 | ByteBuf + 分帧器 + 解码器 |
-| 写出没有完成时关注 OP_WRITE 续写 | Netty 传输层维护待发送数据与续写 |
+| 打开服务端 Channel、绑定端口 | `ServerBootstrap` + `NioServerSocketChannel` |
+| 监听 `OP_ACCEPT` 并接收连接 | boss EventLoop 管理监听 Channel |
+| 将连接注册到 Selector | 将连接 Channel 注册给 worker EventLoop |
+| select、处理就绪事件、执行任务 | EventLoop 的循环 |
+| 保存连接状态与缓冲 | Channel 属性、Handler 状态与 ByteBuf 等；共享 Handler 需注意状态隔离 |
+| 读取字节、拼接完整消息 | 传输层读取配合 ByteBuf、分帧器和解码器 |
+| 部分写入后继续发送 | 传输层管理待写数据，必要时通过写就绪事件续写 |
 
-## 5. 服务端主线
+## 4. 三个组织维度
 
-```text
-ServerBootstrap 组合配置
-    ↓ bind
-监听 Channel 由 boss 管理
-    ↓ 接受连接
-客户端连接 Channel 注册到 worker 的 EventLoop
-    ↓ 安装并执行 Pipeline
-分帧 → 解码 → 业务处理
-    ↓ 生成回复
-出站处理 → 编码 → 网络写出
-```
+| 名称 | 组织什么 | 典型用途 |
+|---|---|---|
+| `EventLoopGroup` | 事件循环 | 调度并处理多个 Channel 的事件与任务 |
+| `ChannelGroup` | 连接等 Channel 的集合 | 批量发送、关闭及集合管理 |
+| `ChannelPipeline` | 单个 Channel 的处理步骤 | 组织编解码、业务及事件处理 |
 
-bossGroup、workerGroup 是职责命名，不是两种不同的 EventLoopGroup 接口类型。线程数由配置决定。
+三者不是上下级关系。连接放进 ChannelGroup，不会因此共享 Pipeline，也不会因此改变所注册的 EventLoop。
 
-## 6. 三个不能混淆的“组/链”
+## 5. 必须分清的边界
 
-- EventLoopGroup：事件线程的组织。
-- ChannelGroup：连接的集合，便于批量发送和关闭。
-- ChannelPipeline：某个 Channel 的处理器链。
+- **连接与线程：** 一个 EventLoop 可管理多个 Channel，不能认为每条连接永久独占一个线程。
+- **Pipeline 与执行线程：** 每个 Channel 有自己的 Pipeline；某些 Handler 可配置到其他执行器，不应笼统认为全链都在同一线程运行。
+- **共享 Pipeline 与共享 Handler：** 不同连接不共用同一个 Pipeline；满足共享条件的 Handler 实例可以被多个 Pipeline 使用，需确保线程安全。
+- **写出与业务成功：** 本地写操作成功，不代表接收方业务已处理成功。应用层可靠性需要按需求设计消息 ID、ACK、重试和去重。
 
-它们分别组织线程、连接、处理步骤。
-
-## 7. 易错点
-
-- 一个 EventLoop 能管理多条连接，并不等于“一个连接永久占一个线程”。
-- 一条连接的 Pipeline 可以在某些 Handler 处切换到业务线程执行。
-- Pipeline 是每个 Channel 自己的；多个 Channel 不会天然共用一个 Pipeline。
-- Netty 的异步写入不能替代应用层业务 ACK。
-
-
-
+本章建立组件地图；线程模型、事件传播、内存管理与写缓冲等细节由对应专题展开。

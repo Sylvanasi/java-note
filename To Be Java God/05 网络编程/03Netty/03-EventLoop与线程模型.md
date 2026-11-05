@@ -1,41 +1,35 @@
 # 03｜EventLoop 与线程模型
 
-## 1. EventLoop 做什么
+![[附件/知识总览/03-EventLoop与线程模型.svg]]
 
-当前 NIO 传输下，EventLoop 循环处理：
+## 1. EventLoop 处理三类工作
 
-1. 多个 Channel 的网络就绪事件。
-2. 提交给它的普通任务。
-3. 到期的定时任务。
+以 NIO 传输为例，一个 EventLoop 循环处理已注册 Channel 的网络就绪事件、提交给它的普通任务以及到期的定时任务。
 
-没有工作时可以在 Selector 等待，因此“非阻塞网络编程”不代表线程一直忙轮询。
+没有工作时可以在 Selector 中等待。网络 I/O 的“非阻塞”不意味着线程必须始终忙轮询，也不意味着 Handler 内的普通 Java 方法会自动变成非阻塞执行。
 
-## 2. boss 与 worker
+## 2. boss、worker 与连接的归属
 
 ```java
 EventLoopGroup bossGroup = new NioEventLoopGroup(1);
 EventLoopGroup workerGroup = new NioEventLoopGroup(1);
 ```
 
-- boss 管理监听 Channel 的接受连接事件。
-- worker 中的 EventLoop 管理建立后的连接。
-- 一个连接注册后通常固定关联一个 EventLoop；同一个 EventLoop 能管理多条连接。
+在典型服务端配置中，boss 管理监听 Channel 的接受连接事件，worker 中的 EventLoop 管理接受连接后的网络 I/O。boss、worker 表达职责，二者都可以使用 NioEventLoopGroup。
 
-## 3. 为什么不能在 EventLoop 中做耗时阻塞操作
+连接注册后，通常持续关联同一个 EventLoop；一个 EventLoop 可以管理多条连接。这里讨论常规注册生命周期，不表示 Netty 绝对禁止注销及重新注册。
 
-假设连接 A、B 由同一个 worker EventLoop 管理：
+因此，连接 A 与 B 即使有独立 Pipeline，也可能共享同一个执行网络事件的线程。
 
-```text
-A 的 Handler 同步查数据库耗时 3 秒
-    ↓
-EventLoop 被这个方法占住
-    ↓
-B 的网络事件、任务和该 EventLoop 上的定时任务也可能延迟
-```
+## 3. 阻塞为何会影响其他连接
 
-常见阻塞来源包括同步 JDBC、同步远程调用、长时间 sleep、等待锁、在当前 EventLoop 上等待需要它自己推进的 Future。
+如果 A 和 B 由同一个 worker EventLoop 管理，A 的 Handler 同步查数据库耗时 3 秒，这段时间 EventLoop 被占用，B 的网络事件、普通任务以及到期定时任务都可能延迟。
 
-## 4. 指定业务执行器
+常见来源包括同步 JDBC、同步远程调用、sleep、锁等待及长时间 CPU 计算。等待一个需要当前 EventLoop 自己推进的 Future，还可能造成死锁风险。
+
+轻量日志、字段判断与短小计算通常可以直接执行。是否拆到业务线程，需要结合阻塞性、耗时和隔离需求判断；切线程本身也有排队与调度成本。
+
+## 4. 业务执行器改变回调线程
 
 ```java
 DefaultEventExecutorGroup businessGroup =
@@ -45,11 +39,13 @@ ch.pipeline().addLast(
         businessGroup, "chatHandler", new ChatHandler());
 ```
 
-这表示该 Handler 的事件回调由分配给它的业务执行器执行。Channel 的网络注册关系没有因此转移，连接仍由原来的 worker EventLoop 管理。
+这个配置使该 Handler 的事件回调交给分配的业务执行器执行。Channel 的网络注册关系并未迁移，I/O 仍由原来的 worker EventLoop 管理。
 
-业务线程也会繁忙，也会排队；两个业务线程不保证任意两个连接永远能同时执行。默认有序执行器会保持每个对应 Context 的任务顺序。
+业务执行器也会排队，两个业务线程不保证任意两条连接都能同时执行业务。DefaultEventExecutorGroup 提供有序执行器，维持分配到同一执行器的任务顺序；它不等于为每条消息新开线程。
 
-## 5. 后续 Handler 能否回到 worker
+不要在每次消息到达时创建一个新的 businessGroup。线程组应作为应用资源统一管理，结束时释放。
+
+## 5. 后续 Handler 如何切回 EventLoop
 
 ```java
 pipeline.addLast(new HandlerA());
@@ -57,19 +53,17 @@ pipeline.addLast(businessGroup, "business", new HandlerB());
 pipeline.addLast(new HandlerC());
 ```
 
-若 B 处理完才继续传播：
+以入站事件依次传播为例：
 
-```text
-worker：执行 A → 提交 B 的任务 → 处理其他工作
-业务线程：执行 B → 提交 C 的任务
-worker：执行 C
-```
+1. worker EventLoop 执行 A，A 向 B 传播时将任务交给 B 的业务执行器，worker 可以继续处理其他工作。
+2. 业务执行器运行 B；B 完成这次处理并向后传播事件时，将 C 的处理交回其执行器。
+3. C 没有显式指定其他执行器，默认由该 Channel 的 EventLoop 执行。
 
-C 没有显式执行器时，默认使用 Channel 的 EventLoop。Netty 在传播时根据目标 Context 的执行器决定是否需要提交任务。
+**消息的后续步骤等待传播，不等于 worker 阻塞等待。** Netty 根据目标 Context 的执行器决定直接调用还是提交任务。
 
-“这条消息的 C 要等 B 传播后才能执行”和“worker 阻塞等 B”是两件不同的事。
+如果 B 自己再次异步提交业务，却在完成前就传播事件，不能据此推断 C 一定在该异步业务完成后执行。处理完成与传播时机需要业务代码明确组织。
 
-## 6. 定时任务
+## 6. 定时任务与进程生命周期
 
 ```java
 channel.eventLoop().scheduleAtFixedRate(
@@ -77,27 +71,8 @@ channel.eventLoop().scheduleAtFixedRate(
         0, 12, TimeUnit.SECONDS);
 ```
 
-任务由这个 EventLoop 执行，不会因为使用了调度方法就自动变成独立的阻塞业务线程。任务本身仍应短小。
+这个任务仍在该 EventLoop 上执行，不会自动得到独立业务线程；执行时间也可能受事件循环繁忙程度影响。12 秒只是例子中的应用参数，不是 TCP 或 Netty 规定的心跳周期。
 
-周期为 12 秒是本次业务发送实验参数，不是 TCP 或 Netty 的固定心跳要求。
+默认 NioEventLoopGroup 使用非守护线程；线程已启动且存活时，即使 main 返回，JVM 仍可继续运行。非守护线程维持进程存活，守护线程不阻止 JVM 在只剩守护线程时正常退出；自定义 ThreadFactory 可以改变线程属性。
 
-## 7. main 返回为什么进程还在
-
-当前 EventLoopGroup 默认启动非守护线程：main 返回后，只要这些线程仍存活，JVM 就会继续运行。
-
-- 非守护线程：会使 JVM 保持运行。
-- 守护线程：不会阻止 JVM 正常退出；只剩守护线程时，JVM 不等待它们完成。
-
-因此：
-
-```text
-main：配置客户端 → connect → 返回
-EventLoop：处理连接 → 网络事件 → 心跳定时任务 → 继续等待
-```
-
-结束客户端时需要管理 Channel 和线程组的生命周期，不应依靠把线程改为守护线程来代替资源清理。
-
-## 8. 业务很快时是否必须单独分组
-
-简单日志、轻量字段判断、短小计算通常不需要专门为每个 Handler 切线程。线程切换和排队也有成本。是否拆分取决于业务是否阻塞、耗时与隔离要求。
-
+退出时应按资源所有权管理连接、周期任务以及 worker、boss、业务执行器组，调用 shutdownGracefully 并观察终止结果。仅把线程改为守护线程，不能替代资源清理。

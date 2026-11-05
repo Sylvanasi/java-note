@@ -1,10 +1,10 @@
 # 02｜启动引导与 Channel
 
-## 1. Bootstrap 负责组合配置
+![[附件/知识总览/02-启动引导与Channel.png]]
 
-服务端使用 `ServerBootstrap`，客户端使用 `Bootstrap`。它们描述线程组、Channel 实现、连接参数和初始化处理器，然后发起异步 bind/connect。
+## 1. Bootstrap 组合配置并发起启动
 
-服务端示意：
+服务端使用 `ServerBootstrap`；客户端通常使用 `Bootstrap`。引导对象组合线程组、Channel 实现、参数和处理器，再发起异步 `bind` 或 `connect`。
 
 ```java
 ServerBootstrap bootstrap = new ServerBootstrap();
@@ -16,40 +16,42 @@ bootstrap.group(bossGroup, workerGroup)
                  ch.pipeline().addLast(new ChatHandler());
              }
          });
-
 ChannelFuture bindFuture = bootstrap.bind(9094);
 ```
 
-片段只展示启动关系；真实 Pipeline 需要先安装匹配协议的分帧器、解码器和编码器。
+这是说明启动关系的局部片段；线程组创建、协议编解码和优雅关闭按实际需要配置，不是完整可运行程序。
 
-## 2. 两类 Channel
+**调用返回不代表绑定成功。** 应通过 Future 的结果或监听器确认；不要在 EventLoop 内用阻塞等待代替异步结果处理。
 
-| 类型 | 作用 | 当前例子 |
+## 2. 监听 Channel 与连接 Channel
+
+| 对象 | 典型 NIO 实现 | 职责 |
 |---|---|---|
-| 监听 Channel | 绑定端口、接收新连接 | NioServerSocketChannel |
-| 连接 Channel | 与一个对端收发数据 | NioSocketChannel |
+| 监听 Channel | `NioServerSocketChannel` | 绑定地址并接受连接 |
+| 服务端连接 Channel | `NioSocketChannel` | 与一个客户端收发数据 |
+| 客户端连接 Channel | `NioSocketChannel` | 与服务端收发数据 |
 
-```text
-监听 Channel：0.0.0.0:9094
-    ├─ 接受客户端 A → 连接 Channel A → Pipeline A
-    └─ 接受客户端 B → 连接 Channel B → Pipeline B
-```
+一个监听 Channel 可以接受多条连接，每条连接拥有自己的状态和 Pipeline。服务端接受的连接可通过 `parent()` 关联监听 Channel，但它不是监听 Channel 内的一块字节分区。
 
-连接 Channel 可以拥有监听 Channel 作为 parent，但不能理解成“所有字节装在一个大 Channel 里的小分区”。它们是不同网络对象，拥有各自的状态和处理链。
+关闭某条连接，不等于关闭监听端口。关闭监听 Channel 也不能代替已接受连接的统一清理；停止接入与关闭存量连接应分别管理。
 
-关闭某个连接 Channel，不代表监听端口关闭。关闭监听 Channel 后，已建立连接的生命周期也需要明确管理。
+监听地址数量不由 boss 线程数直接决定。需要多个监听地址时，可创建并管理多个监听 Channel。
 
-## 3. handler 与 childHandler
+## 3. handler 与 childHandler 的配置对象
 
-- `ServerBootstrap.handler(...)`：为监听 Channel 配置 Handler。
-- `ServerBootstrap.childHandler(...)`：为接受到的新连接配置 Handler/初始化器。
-- 客户端 `Bootstrap.handler(...)`：为客户端自己的连接配置处理链。
+| 配置位置 | 配置对象 |
+|---|---|
+| `ServerBootstrap.handler(...)` | 监听 Channel |
+| `ServerBootstrap.childHandler(...)` | 服务端接受到的连接 Channel |
+| 客户端 `Bootstrap.handler(...)` | 客户端自己的 Channel |
+| `ServerBootstrap.option(...)` | 监听 Channel 的参数 |
+| `ServerBootstrap.childOption(...)` | 接受连接的参数 |
 
-`childHandler` 的重点是“新接收的连接怎么处理”。它不代表把所有业务固定交给 boss 线程。
+`childHandler` 表示“接受连接后怎样初始化和处理”，不表示将业务固定交给 boss。两参数 `group(bossGroup, workerGroup)` 分别配置监听与接受连接所用的事件循环组。
 
-## 4. ChannelInitializer 什么时候执行
+## 4. ChannelInitializer 与 Handler 实例生命周期
 
-新连接初始化时，`initChannel(ch)` 为它安装 Pipeline。
+`ChannelInitializer` 在 Channel 注册后的初始化阶段配置处理链，并在完成初始化后移除自身。它负责安装 Handler，不负责每条消息的解码。
 
 ```java
 protected void initChannel(SocketChannel ch) {
@@ -57,45 +59,35 @@ protected void initChannel(SocketChannel ch) {
 }
 ```
 
-这段写法下：
+在这个创建位置上，每次初始化连接都会创建一个 Decoder：连接 A 使用实例 A，连接 B 使用实例 B；同一条连接收到多条消息时继续使用自己的实例，不是每次 `decode()` 都重新创建。
 
-```text
-连接 A 初始化 → Decoder A → A 的多次消息反复使用它
-连接 B 初始化 → Decoder B → B 的多次消息反复使用它
-```
+- 实例成员字段随实例保留；局部变量在方法调用中创建。
+- `ByteToMessageDecoder` 具有累积与解析状态，不能把同一个实例加入多个连接的 Pipeline。
+- `ChannelInitializer` 本身允许复用；其实现仍需保证安全，不能把各连接的可变状态随意放在共享字段中。
+- 是否共享 Handler 实例由创建位置与共享约束决定，不能只凭类名判断。
 
-不是每次调用 decode 都重新创建 Decoder。成员变量会跨调用保留；局部变量每次调用重新建立。
+## 5. future.channel() 与 ctx.channel() 的区别
 
-`ByteToMessageDecoder` 带有累积与解析状态，不能把同一个实例直接共享给多个连接。
-
-## 5. future.channel() 取到什么
+| 获取位置 | 对应 Channel |
+|---|---|
+| `serverBootstrap.bind(...).channel()` | 本次绑定关联的监听 Channel |
+| `clientBootstrap.connect(...).channel()` | 本次连接关联的客户端 Channel |
+| 服务端连接业务 Handler 的 `ctx.channel()` | 当前客户端对应的服务端连接 Channel |
 
 ```java
-ChannelFuture bindFuture = bootstrap.bind(9094);
+ChannelFuture bindFuture = serverBootstrap.bind(9094);
 Channel serverChannel = bindFuture.channel();
-```
 
-这里拿到监听 Channel。
-
-```java
-ChannelFuture connectFuture = bootstrap.connect("127.0.0.1", 9094);
+ChannelFuture connectFuture = clientBootstrap.connect("127.0.0.1", 9094);
 Channel clientChannel = connectFuture.channel();
 ```
 
-这里拿到客户端的连接 Channel。Future 返回时 Channel 通常已经创建，连接操作仍可能尚未完成。
+以上变量表示不同的引导对象。正常创建 Channel 后，可以在异步操作完成前取得关联 Channel；取得对象本身并不能证明绑定或连接成功。
 
-服务端 `ChatHandler` 中的 `ctx.channel()` 则是当前客户端对应的连接 Channel。
+## 6. 多客户端与易错边界
 
-## 6. 一个监听 Channel 对应多少客户端
+同一份客户端 main 可以启动多个进程，各进程建立自己的连接。未显式绑定本地端口时，通常由操作系统分配临时端口；多个连接可以连接同一个服务端端口。
 
-一个监听 Channel 可以接收多条连接。需要监听多个端口或地址时，可以创建多个监听 Channel，不由 boss 线程数直接决定数量。
+TCP 连接建立后是双向通信。服务端负责接受连接，不代表只能接收；客户端发起连接，也不代表只能发送。
 
-客户端程序同一份 main 可以启动多个进程。每个进程建立自己的连接，连接相同服务端端口，本地端口由操作系统分配。
-
-## 7. 易错点
-
-- bind 返回 Future，不等于绑定已成功。
-- future.channel() 取到的是当前操作关联的 Channel，不是统一的“最大 Channel”。
-- 服务端的 accept 角色不限制收发方向，连接建立后 TCP 双向通信。
-- 在初始化器里 new 的 Handler 默认按这段代码的创建位置复用，不要只凭类名猜实例数量。
-
+复习时先确认三个问题：操作的是监听还是连接 Channel？Handler 装在哪个对象上？Future 表示的是哪一次异步操作？这比将 Channel 理解成统一的“最大容器”更准确。

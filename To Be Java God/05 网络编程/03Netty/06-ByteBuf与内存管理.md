@@ -1,105 +1,108 @@
 # 06｜ByteBuf 与内存管理
 
-## 1. ByteBuf 是什么
+![[附件/知识总览/06-ByteBuf与内存管理.svg]]
 
-ByteBuf 是 Netty 的字节缓冲区，不是 Java NIO 的 ByteBuffer，也不是 byte[]。它们都能承载字节，但操作方式和生命周期机制不同。
+## 1. 缓冲区与独立读写索引
 
-ByteBuf 使用独立的读指针 readerIndex 和写指针 writerIndex：
+ByteBuf 是 Netty 的字节缓冲抽象，不是 byte[] 或 Java NIO ByteBuffer。它提供独立的 readerIndex 与 writerIndex，普通操作下满足：
 
-```text
-[已经读过的区域][当前可读区域][尚未写入的区域]
-              ↑           ↑
-          readerIndex  writerIndex
-```
+`0 ≤ readerIndex ≤ writerIndex ≤ capacity`
 
-`readableBytes()` 是 writerIndex - readerIndex。写入后通常可直接按读指针读取，不照搬 ByteBuffer 的 flip 模式。
-
-## 2. 这些方法是否消费字节
-
-| 方法 | 作用 | 移动读指针 |
+| 区域 | 范围 | 含义 |
 |---|---|---|
-| readByte() | 取一个字节 | 是，移动 1 |
-| readInt() | 取 4 字节整数 | 是，移动 4 |
-| readBytes(byte[]) | 读取对应字节并填入已有数组 | 是 |
+| 已读区域 | 0 到 readerIndex 之前 | 已通过相对读操作消费的字节 |
+| 可读区域 | readerIndex 到 writerIndex 之前 | 当前尚未消费的数据 |
+| 可写区域 | writerIndex 到 capacity 之前 | 当前容量内的可写空间 |
+
+readableBytes 等于 writerIndex - readerIndex。ByteBuf 写入后通常可直接从读索引读取，不照搬 ByteBuffer 的 flip 模式。clear 重置索引，不保证抹除底层数据；读索引前进也不等于释放内存。
+
+## 2. 读取、查看与 EOF 的区别
+
+| 方法 | 行为 | 移动 readerIndex |
+|---|---|---|
+| readByte() | 读取一个字节 | 是，前进 1 |
+| readInt() | 读取四字节整数 | 是，前进 4 |
+| readBytes(byte[]) | 复制到已有数组 | 是 |
 | skipBytes(n) | 跳过 n 字节 | 是 |
-| getByte(index) / getInt(index) | 按绝对位置查看 | 否 |
-| toString(UTF_8) | 把当前可读区域转为 String | 否 |
-| ByteBufUtil.hexDump(buf) | 查看可读区域的十六进制 | 否 |
+| getByte(index) / getInt(index) | 绝对索引访问 | 否 |
+| toString(UTF_8) | 将当前可读区域转换为字符串 | 否 |
+| ByteBufUtil.hexDump(buf) | 当前可读区域的十六进制表示 | 否 |
 
-重要区别：生成字符串不代表原字节已被消费。
+生成字符串不代表消费了原字节。get 方法的索引是绝对位置，解析下一帧时应以当前 readerIndex 为基准，不能始终假设帧从 0 开始。
 
-## 3. readByte 没有 EOF 哨兵
+InputStream.read 返回 int，可用 -1 表示 EOF；ByteBuf.readByte 返回 byte，其中 -1 可能是真实数据 0xFF。没有足够可读字节时相对读操作抛出越界异常，应先检查 isReadable 或 readableBytes。缓冲区当前有数据，不代表协议消息完整；当前无数据，也不代表连接已关闭。
 
-`InputStream.read()` 返回 int，能用 -1 表示 EOF。`ByteBuf.readByte()` 返回 byte：
-
-- -1 可以是实际数据 0xFF。
-- 没有可读数据时继续 readByte，会抛出越界异常。
-- 用 isReadable/readableBytes 判断缓冲区是否还有可读数据；消息是否完整则按协议判断。
-
-## 4. readBytes 的两个重载
+## 3. 复制与共享视图
 
 ```java
 byte[] bytes = new byte[in.readableBytes()];
 in.readBytes(bytes);
 ```
 
-把字节读进已有数组，读指针随之移动。
+该重载填充已有数组并移动读索引。普通数组由 Java 对象生命周期管理。
 
 ```java
 ByteBuf another = in.readBytes(n);
+try {
+    // 消费新缓冲区
+} finally {
+    another.release();
+}
 ```
 
-这个重载返回新 ByteBuf，需要明确其释放责任。忽略返回值不等于自动释放，容易造成泄漏。
+readBytes(n) 返回新分配的 ByteBuf，不能忽略其释放责任。它与只创建共享视图的 readSlice(n) 不同。
 
-## 5. 引用计数解决什么
+| 操作 | 内容是否复制 | 索引与引用 |
+|---|---|---|
+| copy() / readBytes(n) | 复制 | 新缓冲区，需要自己的释放管理；readBytes 会移动源读索引 |
+| slice() / duplicate() | 共享底层内容 | 视图有独立索引，通常不增加共享资源的引用计数 |
+| readSlice(n) | 共享底层内容 | 移动源读索引，通常不增加引用计数 |
+| retainedSlice / retainedDuplicate / readRetainedSlice | 共享底层内容 | 为共享资源保留额外引用，需配对释放 |
 
-同一块缓冲内存可能被多处代码使用。引用计数用于判断什么时候可以回收或归还内存池。
+共享视图不是独立快照。需要让视图独立于原持有者继续使用时，应保留对应引用；原引用失效后不能继续依靠普通 slice 访问资源。
 
-```text
-retain()  → 引用计数 +1
-release() → 引用计数 -1
-降到 0    → 释放或归还资源
-```
+## 4. retain 与 release 管理资源生命周期
 
-ByteBuf 初始引用计数通常为 1。读取已经释放的数据可能触发 IllegalReferenceCountException。
-
-这与 Socket.close、TCP FIN、应用连接数没有直接等价关系。
-
-## 6. retain 返回什么
+普通新分配 ByteBuf 的初始引用计数通常为 1。retain 增加一份引用，release 减少一份；降到 0 时回收底层资源或归还池。释放后继续访问可能抛出 IllegalReferenceCountException。
 
 ```java
 ByteBuf other = buf.retain();
 System.out.println(other == buf); // true
 ```
 
-返回当前 ByteBuf 自身，不复制内容。普通赋值 `other = buf` 不会自动增加引用计数。
+retain 返回当前对象，不复制内容。普通赋值 other = buf 不增加引用计数。引用计数不等于 Java 变量数量，也不等于连接数量、Socket.close 或 TCP FIN。
 
-retain 延长资源生命周期，不自动提供线程安全，不冻结读写指针，也不保存一份独立快照。
+retain 只延长生命周期，不自动提供线程安全、不冻结索引，也不保存内容快照。池化与直接内存是不同维度：可以讨论是否复用内存，也可以讨论内存在堆内还是堆外，不能将两者等同。
 
-## 7. 谁负责释放
+## 5. Handler 的释放责任
 
-普通 ChannelInboundHandlerAdapter 中：
-
-- 仅观察并直接向下游转发：把原来那份的释放责任交给下游。
-- 自己消费并终止传播：负责释放输入。
-- 自己额外 retain 一份：自己负责配对 release 这一份。
+| 场景 | 责任 |
+|---|---|
+| 普通入站 Handler 观察后原样传播 | 交接原引用，通常由下游最终消费者释放 |
+| 自己消费并停止传播 | 释放自己消费的输入 |
+| 额外 retain 后继续持有 | 为额外引用安排配对 release，包括失败路径 |
+| SimpleChannelInboundHandler 匹配并处理输入 | 默认自动释放；继续传递同一引用计数消息时需保留相应引用 |
 
 ```java
 @Override
 public void channelRead(ChannelHandlerContext ctx, Object msg) {
     try {
-        // 在这里消费 msg，不再向下传递
+        // 消费 msg，不再向下游传播
     } finally {
         ReferenceCountUtil.release(msg);
     }
 }
 ```
 
-SimpleChannelInboundHandler 默认会自动释放它匹配并处理的输入。若输入是 ByteBuf，又要继续传递同一份数据，需要保留相应引用，不能在自动释放后让下游使用失效缓冲。
+不要把此消费模板套到原样传播路径，造成下游使用已释放数据。String 或不持有引用计数资源的普通消息对象无需按 ByteBuf 方式 retain/release；但 HttpContent、WebSocketFrame 等持有 ByteBuf 的包装对象仍需管理引用。
 
-普通 String 和本实验的 ChatMessage 没有 ByteBuf 那种引用计数，不需要对它们手动 retain/release。
+已交给 Netty 出站流程的引用计数消息通常由该流程释放；应用若自己丢弃或未成功交接，也要处理资源与操作结果。
 
-## 8. 本次日志实验的真实含义
+## 6. 日志观察与异步交接
+
+最简单的日志方式是在交给下游之前使用不移动索引的 hexDump；若需保存独立观察结果，可先生成字符串或复制所需数据，避免依赖下游之后的可变内容。
+
+下面是同步传播场景下保留额外引用的局部示例：
 
 ```java
 int start = buf.readerIndex();
@@ -113,25 +116,8 @@ try {
 }
 ```
 
-为了在向下游传播后继续观察原数据，日志 Handler 额外保留一份。预先记录范围，是因为下游可能移动同一个缓冲对象的读指针。
+预先记录范围可以避免下游移动读索引影响查看范围，但不保证内容未被下游修改或压缩。若跨执行器并发访问同一缓冲区，此示例本身不提供线程安全；优先在交接前生成日志快照。
 
-完整消息且下游释放原引用时，典型计数为：
+在下游同步消费并释放原引用的特定路径中，计数可以依次为 1、retain 后 2、下游释放后 1、额外引用释放后 0。如果分帧器还持有未完成数据，我方释放后仍为 1 也可能完全正常；不能凭一次观测的计数判断 finally 未执行或一定泄漏。
 
-```text
-收到 1 → 我方 retain 得到 2 → 下游释放剩 1 → 我方 release 到 0
-```
-
-如果分帧器还保留着未完成数据，传播调用返回时可能仍是 2；我方 release 后剩 1，由分帧器继续持有。这不表示 finally 没执行，也不表示一定泄漏。
-
-不能把某一次计数序列写成所有 Pipeline 都必须遵循的固定规则。
-
-## 9. ByteBuf 与异步业务的关系
-
-如果解码器已经把字节变成独立 String 或普通消息对象，后面的业务线程不再依赖原始 ByteBuf，可以按字节处理链的责任释放它。
-
-如果确实要把同一块 ByteBuf 额外交给异步任务，必须明确引用交接、失败路径释放以及并发访问方式；retain 只解决生命周期中的一部分问题。
-
-## 参考
-
-- [Netty 引用计数说明](https://netty.io/wiki/reference-counted-objects.html)
-- [ByteBuf API](https://netty.io/4.1/api/io/netty/buffer/ByteBuf.html)
+如果解码得到独立 String 或普通业务对象，后续异步业务不再依赖原 ByteBuf。确实需要将 ByteBuf 额外交给异步任务时，必须明确引用交接、任务拒绝和异常路径释放、索引及内容的并发访问约束。retain 只是其中一部分。
